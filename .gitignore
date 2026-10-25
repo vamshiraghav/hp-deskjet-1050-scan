@@ -1,0 +1,11 @@
+.DS_Store
+build/
+*.tar.gz
+hplip-*/
+*.o
+*.lo
+*.la
+.libs/
+__pycache__/
+*.pyc
+.derived/

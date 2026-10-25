@@ -1,0 +1,79 @@
+--- a/io/hpmud/musb.c
++++ b/io/hpmud/musb.c
+@@ -758,7 +758,7 @@ static int device_id(int fd, unsigned char *buffer, int size)
+ 
+     maxSize = (size > 1024) ? 1024 : size;   /* RH8 has a size limit for device id (usb) */
+ 
+-    rlen = libusb_control_transfer(hd,
++    rlen = libusb_control_transfer(hd,                          /* macOS: see workaround below */
+             LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE, /* bmRequestType */
+             LIBUSB_REQUEST_GET_STATUS,        /* bRequest */
+             config,        /* wValue */
+@@ -767,8 +767,58 @@ static int device_id(int fd, unsigned char *buffer, int size)
+ 
+     if (rlen < 0)
+     {
++#ifdef __APPLE__
++        /* macOS workaround for USB MFPs whose firmware STALs IEEE 1284
++         * GET_DEVICE_ID (LIBUSB_ERROR_PIPE). HPLIP matches data/models/models.dat
++         * on the MDL field. The DeskJet 1050 J410 (USB 03f0:8911) reports the
++         * product string "Deskjet 1050 J410 series"; a model-less id will not
++         * select deskjet_1050_j410_series (scan-type LEDM, no proprietary plugin).
++         * Prefer the live product string. If that read fails and the PID is
++         * 0x8911, use the 1050 name. Any other HP falls back to a minimal id.
++         */
++        {
++            struct libusb_device_descriptor desc;
++            unsigned char product[256];
++            char fake_id[768];
++            const char *mdl = NULL;
++            int fake_len;
++            int i;
++
++            product[0] = '\0';
++            memset(&desc, 0, sizeof(desc));
++            if (hd && libusb_get_device_descriptor(libusb_get_device(hd), &desc) == 0) {
++                if (desc.iProduct)
++                    libusb_get_string_descriptor_ascii(hd, desc.iProduct, product, (int)sizeof(product) - 1);
++                if (desc.idVendor == 0x03f0 && desc.idProduct == 0x8911)
++                    mdl = "Deskjet 1050 J410 series";
++            }
++            if (product[0] != '\0') {
++                for (i = 0; product[i] != '\0'; i++) {
++                    if (product[i] == ';' || product[i] == '\n' || product[i] == '\r')
++                        product[i] = ' ';
++                }
++                mdl = (const char *)product;
++            }
++            if (mdl != NULL && mdl[0] != '\0') {
++                snprintf(fake_id, sizeof(fake_id),
++                    "MFG:HP;MDL:%s;CMD:MLC,PCL,PML,DW-PCL,DESKJET,DYN;CLS:PRINTER;DES:%s;",
++                    mdl, mdl);
++            } else {
++                snprintf(fake_id, sizeof(fake_id), "MFG:HP;CMD:LEDM;CLS:PRINTER;");
++            }
++            fake_len = (int)strlen(fake_id);
++            if (fake_len >= size)
++                fake_len = size - 1;
++            if (fake_len < 0)
++                fake_len = 0;
++            memcpy(buffer, fake_id, (size_t)fake_len);
++            buffer[fake_len] = '\0';
++            return fake_len;
++        }
++#else
+         BUG("invalid deviceid ret=%d: %m\n", rlen);
+         goto bugout;
++#endif
+     }
+ 
+     len = ntohs(*(short *)buffer);
+@@ -2178,7 +2228,7 @@ int __attribute__ ((visibility ("hidden"))) musb_probe_devices(char *lst, int ls
+     }//end for loop
+ 
+ bugout:
+-    if (!hd)
++    if (hd)            /* fix: previous code closed a NULL handle on the success path */
+         libusb_close(hd);
+     if (confptr)
+         libusb_free_config_descriptor(confptr);
