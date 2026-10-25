@@ -42,16 +42,29 @@ cd "hplip-${HPLIP_VER}"
 log "applying macOS and DeskJet 1050 patches"
 cp "$ROOT/stubs/orblitei.h" scan/sane/orblitei.h
 cp "$ROOT/stubs/orblite.c" scan/sane/orblite.c
-if [[ ! -f .dj1050-patched ]]; then
-    for patch_file in "$ROOT"/patches/*.patch; do
-        if ! patch -p1 --forward --silent < "$patch_file"; then
-            echo "patch failed: $(basename "$patch_file")" >&2
-            patch -p1 --forward < "$patch_file" || true
-            exit 1
-        fi
+# A file stamp from the first build only recorded that some patches had
+# been applied. Later patches must still be applied to that same tree.
+if [[ -f .dj1050-patched ]]; then
+    rm -f .dj1050-patched
+    mkdir -p .dj1050-applied
+    for patch_file in "$ROOT"/patches/0[123]-*.patch; do
+        [[ -f "$patch_file" ]] || continue
+        touch ".dj1050-applied/$(basename "$patch_file")"
     done
-    touch .dj1050-patched
 fi
+mkdir -p .dj1050-applied
+for patch_file in "$ROOT"/patches/*.patch; do
+    stamp=".dj1050-applied/$(basename "$patch_file")"
+    if [[ -f "$stamp" ]]; then
+        continue
+    fi
+    if ! patch -p1 --forward --silent < "$patch_file"; then
+        echo "patch failed: $(basename "$patch_file")" >&2
+        patch -p1 --forward < "$patch_file" || true
+        exit 1
+    fi
+    touch "$stamp"
+done
 
 python3 - <<'PY'
 from pathlib import Path

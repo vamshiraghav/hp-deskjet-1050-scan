@@ -38,6 +38,16 @@ SANE_MODES = {
     "grey": "Gray",
     "lineart": "Lineart",
 }
+# HPLIP: a smaller JPEG compression factor is a clearer picture.
+# 0 matches the Windows HP Scan "None" compression setting.
+JPEG_QUALITY = 0
+SAVE_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+CONTENT_TYPES = {
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "tiff": "image/tiff",
+    "pdf": "application/pdf",
+}
 ESCL_MODES = {
     "RGB24": "Color",
     "Grayscale8": "Gray",
@@ -108,7 +118,9 @@ def host_addresses() -> set[str]:
 
 def is_local_peer(addr: str, local_addrs: set[str] | None = None) -> bool:
     """Allow Image Capture on this Mac, and refuse other machines on the LAN."""
-    if addr in {"127.0.0.1", "::1"}:
+    if addr.startswith("::ffff:"):
+        addr = addr.removeprefix("::ffff:")
+    if addr in {"127.0.0.1", "::1", "0:0:0:0:0:0:0:1"}:
         return True
     addrs = host_addresses() if local_addrs is None else local_addrs
     return addr in addrs
@@ -247,17 +259,28 @@ def geometry_args(paper: str) -> list[str]:
     ]
 
 
-def scanimage_args(device: str, dpi: int, mode: str, paper: str, output: Path, with_geometry: bool) -> list[str]:
+def scanimage_args(
+    device: str,
+    dpi: int,
+    mode: str,
+    paper: str,
+    output: Path,
+    with_geometry: bool,
+    jpeg_quality: int = JPEG_QUALITY,
+    with_quality: bool = True,
+) -> list[str]:
     args = [
         "scanimage",
         "-d", device,
         "--mode", SANE_MODES[mode],
         "--resolution", str(dpi),
-        "--format=jpeg",
-        "-o", str(output),
     ]
     if with_geometry:
-        args[5:5] = geometry_args(paper)
+        args.extend(geometry_args(paper))
+    args.append("--format=jpeg")
+    if with_quality:
+        args.extend(["--jpeg-quality", str(jpeg_quality)])
+    args.extend(["-o", str(output)])
     return args
 
 
@@ -274,9 +297,15 @@ def io_busy(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
-def geometry_rejected(text: str) -> bool:
+def option_rejected(text: str) -> bool:
     lowered = text.lower()
-    return "unrecognized option" in lowered or "unknown option" in lowered
+    markers = (
+        "unrecognized option",
+        "unknown option",
+        "invalid argument",
+        "option is inactive",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def pause_queues(names: list[str]) -> list[str]:
@@ -298,9 +327,11 @@ def convert_image(jpeg: Path, destination: Path, kind: str) -> None:
         if jpeg.resolve() != destination.resolve():
             destination.write_bytes(jpeg.read_bytes())
         return
-    image_format = "pdf" if kind == "pdf" else "png"
+    formats = {"pdf": "pdf", "png": "png", "tiff": "tiff"}
+    if kind not in formats:
+        raise RuntimeError(f"unsupported format {kind}")
     result = run(
-        ["sips", "-s", "format", image_format, str(jpeg), "--out", str(destination)],
+        ["sips", "-s", "format", formats[kind], str(jpeg), "--out", str(destination)],
         timeout=60,
     )
     if result.returncode != 0 or not destination.is_file():
@@ -309,26 +340,29 @@ def convert_image(jpeg: Path, destination: Path, kind: str) -> None:
 
 
 def capture_page(device: str, dpi: int, mode: str, paper: str, jpeg: Path) -> None:
-    def once(with_geometry: bool) -> subprocess.CompletedProcess[str]:
-        return run(
-            scanimage_args(device, dpi, mode, paper, jpeg, with_geometry),
+    geometry = True
+    quality = True
+
+    def once() -> tuple[subprocess.CompletedProcess[str], str]:
+        result = run(
+            scanimage_args(device, dpi, mode, paper, jpeg, geometry, with_quality=quality),
             timeout=300,
         )
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+        return result, text
 
-    result = once(True)
-    combined = (result.stdout or "") + "\n" + (result.stderr or "")
-    if result.returncode != 0 and geometry_rejected(combined):
-        result = once(False)
-        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    result, combined = once()
+    if result.returncode != 0 and option_rejected(combined):
+        quality = False
+        result, combined = once()
+    if result.returncode != 0 and option_rejected(combined):
+        geometry = False
+        result, combined = once()
     if result.returncode != 0 and io_busy(combined):
         paused = pause_queues(cups_queues())
         try:
             time.sleep(1)
-            result = once(True)
-            combined = (result.stdout or "") + "\n" + (result.stderr or "")
-            if result.returncode != 0 and geometry_rejected(combined):
-                result = once(False)
-                combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            result, combined = once()
         finally:
             resume_queues(paused)
     if result.returncode != 0 or not jpeg.is_file() or jpeg.stat().st_size < 100:
@@ -341,14 +375,30 @@ def default_output(kind: str) -> Path:
     return Path.home() / "Desktop" / f"DeskJet1050-{stamp}.{kind}"
 
 
+def normalize_destination(destination: Path, kind: str) -> Path:
+    if destination.suffix.lower() in SAVE_SUFFIXES:
+        return destination
+    extension = {"jpeg": "jpg", "tiff": "tiff"}.get(kind, kind)
+    return destination.with_suffix("." + extension)
+
+
+def output_kind(document: str) -> str:
+    lowered = document.lower()
+    if "pdf" in lowered:
+        return "pdf"
+    if "png" in lowered:
+        return "png"
+    if "tif" in lowered:
+        return "tiff"
+    return "jpeg"
+
+
 def do_scan(dpi: int, mode: str, paper: str, output: Path | None, kind: str, open_after: bool) -> Path:
     payload = status_payload()
     device = payload["sane_device"]
     if not device:
         raise RuntimeError(payload["message"])
-    destination = output or default_output(kind)
-    if destination.suffix.lower() not in {".pdf", ".jpg", ".jpeg", ".png"}:
-        destination = destination.with_suffix("." + ("jpg" if kind == "jpeg" else kind))
+    destination = normalize_destination(output or default_output(kind), kind)
     destination.parent.mkdir(parents=True, exist_ok=True)
     work = destination.with_suffix(".scan.jpg")
     print(f"Scanning {device} at {dpi} DPI, {SANE_MODES[mode]}, {paper}.", flush=True)
@@ -397,10 +447,14 @@ BRIDGE = BridgeState()
 
 
 class EsclHandler(BaseHTTPRequestHandler):
+    # Image Capture speaks HTTP/1.1. The library default is 1.0, which it ignores.
+    protocol_version = "HTTP/1.1"
     server_version = "DeskJet1050Scan/1.0"
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("dj1050-bridge " + (fmt % args) + "\n")
+        peer = self.client_address[0] if self.client_address else "?"
+        sys.stderr.write(f"dj1050-bridge {peer} " + (fmt % args) + "\n")
+        sys.stderr.flush()
 
     def _reject_remote(self) -> bool:
         peer = self.client_address[0]
@@ -446,6 +500,8 @@ class EsclHandler(BaseHTTPRequestHandler):
         dpi = int(xml_text(root, "XResolution", "300") or "300")
         color = xml_text(root, "ColorMode", "RGB24")
         document = xml_text(root, "DocumentFormat", "image/jpeg")
+        sys.stderr.write(f"dj1050-bridge settings dpi={dpi} color={color} format={document}\n")
+        sys.stderr.flush()
         with BRIDGE.lock:
             job_id = str(BRIDGE.next_id)
             BRIDGE.next_id += 1
@@ -511,12 +567,14 @@ class EsclHandler(BaseHTTPRequestHandler):
       <scan:SettingProfiles>
         <scan:SettingProfile>
           <scan:ColorModes>
-            <scan:ColorMode>BlackAndWhite1</scan:ColorMode>
-            <scan:ColorMode>Grayscale8</scan:ColorMode>
             <scan:ColorMode>RGB24</scan:ColorMode>
+            <scan:ColorMode>Grayscale8</scan:ColorMode>
+            <scan:ColorMode>BlackAndWhite1</scan:ColorMode>
           </scan:ColorModes>
           <scan:DocumentFormats>
             <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+            <pwg:DocumentFormat>image/png</pwg:DocumentFormat>
+            <pwg:DocumentFormat>image/tiff</pwg:DocumentFormat>
             <pwg:DocumentFormat>application/pdf</pwg:DocumentFormat>
           </scan:DocumentFormats>
           <scan:SupportedResolutions>
@@ -605,26 +663,28 @@ def render_job(job: dict) -> tuple[bytes, str]:
         data = work.read_bytes()
     finally:
         work.unlink(missing_ok=True)
-    if "pdf" in job["format"]:
-        pdf = Path(f"/tmp/dj1050-job-{job['id']}.pdf")
-        jpeg = Path(f"/tmp/dj1050-job-{job['id']}-src.jpg")
-        try:
-            jpeg.write_bytes(data)
-            convert_image(jpeg, pdf, "pdf")
-            return pdf.read_bytes(), "application/pdf"
-        finally:
-            jpeg.unlink(missing_ok=True)
-            pdf.unlink(missing_ok=True)
-    return data, "image/jpeg"
+    kind = output_kind(str(job["format"]))
+    if kind == "jpeg":
+        return data, CONTENT_TYPES["jpeg"]
+    converted = Path(f"/tmp/dj1050-job-{job['id']}.{kind}")
+    source = Path(f"/tmp/dj1050-job-{job['id']}-src.jpg")
+    try:
+        source.write_bytes(data)
+        convert_image(source, converted, kind)
+        return converted.read_bytes(), CONTENT_TYPES[kind]
+    finally:
+        source.unlink(missing_ok=True)
+        converted.unlink(missing_ok=True)
 
 
 def advertise(port: int, stop: threading.Event) -> None:
     uuid = stable_uuid(MODEL_NAME)
+    # Advertise on this Mac's own address. Image Capture will not open a
+    # scanner whose Bonjour record points at the hostname "localhost".
     args = [
-        "dns-sd", "-P", MODEL_NAME, "_uscan._tcp", "local", str(port),
-        "localhost", "127.0.0.1",
+        "dns-sd", "-R", MODEL_NAME, "_uscan._tcp", "local", str(port),
         "txtvers=1", "vers=2.63", f"ty={MODEL_NAME}",
-        "rs=eSCL", "pdl=image/jpeg,application/pdf",
+        "rs=eSCL", "pdl=image/jpeg,image/png,image/tiff,application/pdf",
         "cs=color,grayscale", "is=platen", "duplex=F",
         f"UUID={uuid}", f"adminurl=http://127.0.0.1:{port}/",
     ]
@@ -642,14 +702,29 @@ def advertise(port: int, stop: threading.Event) -> None:
             time.sleep(2)
 
 
+class BridgeServer(ThreadingHTTPServer):
+    """Listen on IPv4 and IPv6. Image Capture connects to localhost as ::1."""
+
+    address_family = socket.AF_INET6
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
 def serve_bridge(port: int, advertise_service: bool = True) -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", port), EsclHandler)
+    try:
+        server = BridgeServer(("::", port), EsclHandler)
+    except OSError:
+        server = ThreadingHTTPServer(("127.0.0.1", port), EsclHandler)
     stop = threading.Event()
     advertiser = None
     if advertise_service and os.environ.get("DJ1050_NO_MDNS") != "1":
         advertiser = threading.Thread(target=advertise, args=(port, stop), daemon=True)
         advertiser.start()
-    print(f"DeskJet 1050 AirScan bridge on http://127.0.0.1:{port}", flush=True)
+    print(f"DeskJet 1050 AirScan bridge on localhost:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -719,7 +794,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--mode", default="color", choices=("color", "gray", "grey", "lineart"))
     scan.add_argument("--paper", default="a4", choices=tuple(PAPER_MM))
     scan.add_argument("--output", type=Path)
-    scan.add_argument("--format", default="pdf", choices=("pdf", "jpeg", "png"))
+    scan.add_argument("--format", default="pdf", choices=("pdf", "jpeg", "png", "tiff"))
     scan.add_argument("--no-open", action="store_true")
 
     bridge = sub.add_parser("bridge", help="serve a local AirScan endpoint for Image Capture")

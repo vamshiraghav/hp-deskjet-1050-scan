@@ -34,10 +34,17 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(args[args.index("--br-x") + 1], "210")
         self.assertEqual(args[args.index("--br-y") + 1], "297")
         self.assertEqual(args[args.index("--mode") + 1], "Color")
+        self.assertEqual(args[args.index("--jpeg-quality") + 1], "0")
+
+    def test_save_name_keeps_a_real_suffix(self):
+        self.assertEqual(dj.normalize_destination(Path("/tmp/page.tiff"), "jpeg").name, "page.tiff")
+        self.assertEqual(dj.normalize_destination(Path("/tmp/page.img"), "jpeg").name, "page.jpg")
+        self.assertEqual(dj.normalize_destination(Path("/tmp/page"), "pdf").name, "page.pdf")
 
     def test_local_peer_rejects_other_machines(self):
         local = {"127.0.0.1", "::1", "192.168.1.20"}
         self.assertTrue(dj.is_local_peer("127.0.0.1", local))
+        self.assertTrue(dj.is_local_peer("::ffff:127.0.0.1", local))
         self.assertTrue(dj.is_local_peer("192.168.1.20", local))
         self.assertFalse(dj.is_local_peer("8.8.8.8", local))
         self.assertFalse(dj.is_local_peer("192.168.1.55", local))
@@ -52,6 +59,11 @@ class DriverTests(unittest.TestCase):
             caps = urllib.request.urlopen(base + "/eSCL/ScannerCapabilities", timeout=5).read()
             self.assertIn(b"HP DeskJet 1050 J410", caps)
             self.assertIn(b"1200", caps)
+            self.assertLess(caps.find(b"RGB24"), caps.find(b"BlackAndWhite1"))
+            self.assertIn(b"image/jpeg", caps)
+            self.assertIn(b"image/png", caps)
+            self.assertIn(b"image/tiff", caps)
+            self.assertIn(b"application/pdf", caps)
             body = b"""<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03">
               <scan:XResolution>300</scan:XResolution>
               <scan:ColorMode>RGB24</scan:ColorMode>

@@ -31,7 +31,7 @@ This model provides neither by itself. A DriverKit USB driver is not a usable su
 ## What this project installs
 
 1. HPLIP's GPL `hpaio` SANE backend, built for Darwin, with the DeskJet 1050 model names the USB product string actually uses (`Deskjet 1050 J410 series`).
-2. A small command, `dj1050-scan`, that selects that device, scans the glass, and writes PDF, JPEG, or PNG.
+2. A small command, `dj1050-scan`, that selects that device, scans the glass, and writes PDF, JPEG, PNG, or TIFF.
 3. A Mac app, DeskJet 1050 Scan, for the same scan.
 4. An optional local AirScan bridge on `127.0.0.1:8092` so Image Capture can see the flatbed. Requests from other computers are refused. Ports 8080 and 8081 are left alone because other local tools use them.
 
@@ -39,6 +39,12 @@ Printing stays on the existing CUPS queue. This project does not replace it.
 
 The Darwin build fixes (missing headers, the unused Orblite plugin, an uninitialized device-list call, a USB device-id stall, and a null-handle close) follow the same approach as the public macOS port of `hpaio` for other LEDM printers. The 1050-specific part is the model alias and a device-id string that includes `MDL`, so a stalled `GET_DEVICE_ID` still matches this record.
 
-## What was not verified on the glass
+## Image quality
 
-While this was built, `ioreg` did not show USB `03f0:8911`. The CUPS queues for the printer were present and offline. A page was not scanned, because the flatbed was not connected. After the cable is plugged in, `dj1050-scan doctor` should report the scanner, and a 300 DPI color scan is the first check.
+HP's LEDM scan job in HPLIP 3.25.8 hardcodes `<CompressionQFactor>15</CompressionQFactor>` and ignores the SANE `jpeg-quality` option. HPLIP documents that factor as "larger numbers mean better compression, and smaller numbers mean better image quality." 15 is a soft, blocky JPEG, which is why a color page can look dull. The Windows HP Scan window for this model exposes JPEG, PDF, PNG, and TIFF, plus Color, Grayscale, and Black and white, and its advanced quality control can be set to no compression.
+
+`patches/04-ledm-jpeg-quality.patch` sends the SANE factor instead. `dj1050-scan` passes `0`, the clear end of that scale. The Mac app follows the Windows order: choose Color, scan, look at the page, then save as JPEG, PDF, PNG, or TIFF.
+
+## What was checked on the glass
+
+A later session with the cable connected listed `hpaio:/usb/Deskjet_1050_J410_series` and completed a 1,200 DPI color scan from the app. Image Capture listed the flatbed under Shared and retrieved a page. The JPEG-quality change above is compiled into the backend and still needs one new page on the glass to confirm the picture is clearer.

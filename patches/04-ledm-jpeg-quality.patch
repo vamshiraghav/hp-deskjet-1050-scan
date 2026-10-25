@@ -1,0 +1,19 @@
+--- a/scan/sane/bb_ledm.c
++++ b/scan/sane/bb_ledm.c
+@@ -191,7 +191,7 @@
+ <YStart>%d</YStart>\
+ <Height>%d</Height>\
+ <Format>%s</Format>\
+-<CompressionQFactor>15</CompressionQFactor>\
++<CompressionQFactor>%d</CompressionQFactor>\
+ <ColorSpace>%s</ColorSpace>\
+ <BitDepth>%d</BitDepth>\
+ <InputSource>%s</InputSource>\
+@@ -899,6 +899,7 @@
+         (int) (ps->currentTly / 5548.7133),//<YStart>
+         (int) ((ps->currentBry / 5548.7133) - (ps->currentTly / 5548.7133)),//<Height>
+         "Jpeg",//<Format>
++        ps->currentJpegQuality < 0 ? 0 : (ps->currentJpegQuality > 100 ? 100 : ps->currentJpegQuality),
+         (! strcmp(ce_element[ps->currentScanMode], "Color8")) ? "Color" : (! strcmp(ce_element[ps->currentScanMode], "Gray8")) ? "Gray" : "Gray",//<ColorSpace>
+         ((! strcmp(ce_element[ps->currentScanMode], "Color8")) || (! strcmp(ce_element[ps->currentScanMode], "Gray8"))) ? 8: 8,//<BitDepth>
+         ps->currentInputSource == IS_PLATEN ? is_element[1] : is_element[2],//<InputSource>

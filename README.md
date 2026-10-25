@@ -26,7 +26,9 @@ dj1050-scan doctor
 dj1050-scan --dpi 300 --mode color --paper a4
 ```
 
-The PDF is saved on the Desktop and opened in Preview. `--paper` accepts `a4`, `letter`, or `full`. `--format` accepts `pdf`, `jpeg`, or `png`.
+The app scans first and shows the page. **Output type** is Color, Grayscale, or Black and white. **File type** is JPEG, PDF, PNG, or TIFF, and Save asks for that file. Rotate, Lighter, and Darker apply to the preview before it is written.
+
+From the terminal, `--paper` accepts `a4`, `letter`, or `full`. `--format` accepts `pdf`, `jpeg`, `png`, or `tiff`. `--mode` accepts `color`, `gray`, or `lineart`. Color is the default. The scanner is asked for its clearest JPEG, the same idea as HP Scan's "None" compression on Windows.
 
 ## Image Capture and Preview
 
