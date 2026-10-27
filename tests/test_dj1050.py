@@ -2,6 +2,7 @@
 """Tests that do not need the printer attached."""
 
 import importlib.machinery
+import io
 import os
 import threading
 import unittest
@@ -31,10 +32,39 @@ class DriverTests(unittest.TestCase):
 
     def test_a4_geometry_matches_the_glass(self):
         args = dj.scanimage_args("hpaio:/usb/Deskjet_1050", 300, "color", "a4", Path("/tmp/x.jpg"), True)
-        self.assertEqual(args[args.index("--br-x") + 1], "210")
-        self.assertEqual(args[args.index("--br-y") + 1], "297")
+        self.assertEqual(args[args.index("-l") + 1], "0")
+        self.assertEqual(args[args.index("-t") + 1], "0")
+        self.assertEqual(args[args.index("-x") + 1], "210")
+        self.assertEqual(args[args.index("-y") + 1], "297")
         self.assertEqual(args[args.index("--mode") + 1], "Color")
         self.assertEqual(args[args.index("--jpeg-quality") + 1], "0")
+        selected = dj.scanimage_args(
+            "hpaio:/usb/Deskjet_1050", 600, "color", "a4", Path("/tmp/x.jpg"), True,
+            region=(20, 30, 120, 160),
+        )
+        self.assertEqual(selected[selected.index("-l") + 1], "20")
+        self.assertEqual(selected[selected.index("-t") + 1], "30")
+        self.assertEqual(selected[selected.index("-x") + 1], "100")
+        self.assertEqual(selected[selected.index("-y") + 1], "130")
+        full = dj.geometry_args("full")
+        self.assertEqual(full[full.index("-x") + 1], "215.9")
+        self.assertEqual(dj.parse_region("20,30,120,160", "a4"), (20.0, 30.0, 120.0, 160.0))
+        self.assertTrue(dj.io_busy("scanimage: sane_start: Device busy"))
+        self.assertTrue(dj.option_rejected("scanimage: attempted to set inactive option jpeg-quality"))
+
+    def test_preview_shows_each_tenth_of_the_page(self):
+        width, height = 4, 10
+        pixels = bytes([255, 0, 0]) * (width * height)
+        payload = b"P6\n# scanner\n%d %d\n255\n" % (width, height) + pixels
+        marks = []
+        live = Path("/tmp/dj1050-progress-test.jpg")
+        raw, got_width, got_height, channels = dj.stream_pnm_preview(
+            io.BytesIO(payload), live, marks.append, step=10
+        )
+        self.assertEqual(marks, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+        self.assertEqual((got_width, got_height, channels), (4, 10, 3))
+        self.assertEqual(len(raw), width * height * 3)
+        self.assertGreater(live.stat().st_size, 100)
 
     def test_save_name_keeps_a_real_suffix(self):
         self.assertEqual(dj.normalize_destination(Path("/tmp/page.tiff"), "jpeg").name, "page.tiff")

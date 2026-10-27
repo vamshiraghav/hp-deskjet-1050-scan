@@ -249,14 +249,46 @@ def status_payload() -> dict:
     }
 
 
-def geometry_args(paper: str) -> list[str]:
-    width, height = PAPER_MM[paper]
+def format_mm(value: float) -> str:
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+# scanimage 1.4 takes the scan window as position plus size. This glass stops at 215.9 mm.
+GLASS_MM = (215.9, 297.011)
+
+
+def geometry_args(paper: str, region: tuple[float, float, float, float] | None = None) -> list[str]:
+    if region is None:
+        width, height = PAPER_MM[paper]
+        tlx, tly, brx, bry = 0.0, 0.0, width, height
+    else:
+        tlx, tly, brx, bry = region
+    right = min(brx, GLASS_MM[0])
+    bottom = min(bry, GLASS_MM[1])
+    left = min(max(tlx, 0.0), right)
+    top = min(max(tly, 0.0), bottom)
+    # scanimage's -x and -y are the width and height. It adds them to -l and -t
+    # and stores the far corner in the backend's br-x and br-y options.
     return [
-        "--tl-x", "0",
-        "--tl-y", "0",
-        "--br-x", f"{width:g}",
-        "--br-y", f"{height:g}",
+        "-l", format_mm(left),
+        "-t", format_mm(top),
+        "-x", format_mm(right - left),
+        "-y", format_mm(bottom - top),
     ]
+
+
+def parse_region(text: str, paper: str) -> tuple[float, float, float, float]:
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 4:
+        raise RuntimeError("region must be left,top,right,bottom in millimetres")
+    try:
+        tlx, tly, brx, bry = (float(part) for part in parts)
+    except ValueError as exc:
+        raise RuntimeError("region must be left,top,right,bottom in millimetres") from exc
+    width, height = PAPER_MM[paper]
+    if tlx < 0 or tly < 0 or brx > width + 0.2 or bry > height + 0.2 or brx - tlx < 5 or bry - tly < 5:
+        raise RuntimeError("the selected area is outside the page or smaller than 5 mm")
+    return tlx, tly, brx, bry
 
 
 def scanimage_args(
@@ -264,10 +296,12 @@ def scanimage_args(
     dpi: int,
     mode: str,
     paper: str,
-    output: Path,
+    output: Path | None,
     with_geometry: bool,
     jpeg_quality: int = JPEG_QUALITY,
     with_quality: bool = True,
+    image_format: str = "jpeg",
+    region: tuple[float, float, float, float] | None = None,
 ) -> list[str]:
     args = [
         "scanimage",
@@ -276,11 +310,12 @@ def scanimage_args(
         "--resolution", str(dpi),
     ]
     if with_geometry:
-        args.extend(geometry_args(paper))
-    args.append("--format=jpeg")
+        args.extend(geometry_args(paper, region))
+    args.append(f"--format={image_format}")
     if with_quality:
         args.extend(["--jpeg-quality", str(jpeg_quality)])
-    args.extend(["-o", str(output)])
+    if output is not None:
+        args.extend(["-o", str(output)])
     return args
 
 
@@ -292,6 +327,7 @@ def io_busy(text: str) -> bool:
         "error during device i/o",
         "resource busy",
         "access denied",
+        "device busy",
         "device is busy",
     )
     return any(marker in lowered for marker in markers)
@@ -304,6 +340,7 @@ def option_rejected(text: str) -> bool:
         "unknown option",
         "invalid argument",
         "option is inactive",
+        "inactive option",
     )
     return any(marker in lowered for marker in markers)
 
@@ -311,15 +348,21 @@ def option_rejected(text: str) -> bool:
 def pause_queues(names: list[str]) -> list[str]:
     paused: list[str] = []
     for name in names:
-        result = run(["cupsdisable", name], timeout=15)
+        result = run(["/usr/sbin/cupsdisable", name], timeout=15)
         if result.returncode == 0:
             paused.append(name)
     return paused
 
 
 def resume_queues(names: list[str]) -> None:
+    if names:
+        time.sleep(0.4)
     for name in names:
-        run(["cupsenable", name], timeout=15)
+        for _ in range(6):
+            result = run(["/usr/sbin/cupsenable", name], timeout=15)
+            if result.returncode == 0:
+                break
+            time.sleep(0.4)
 
 
 def convert_image(jpeg: Path, destination: Path, kind: str) -> None:
@@ -339,13 +382,23 @@ def convert_image(jpeg: Path, destination: Path, kind: str) -> None:
         raise RuntimeError(detail)
 
 
-def capture_page(device: str, dpi: int, mode: str, paper: str, jpeg: Path) -> None:
+def capture_page(
+    device: str,
+    dpi: int,
+    mode: str,
+    paper: str,
+    jpeg: Path,
+    region: tuple[float, float, float, float] | None = None,
+) -> None:
     geometry = True
     quality = True
 
     def once() -> tuple[subprocess.CompletedProcess[str], str]:
         result = run(
-            scanimage_args(device, dpi, mode, paper, jpeg, geometry, with_quality=quality),
+            scanimage_args(
+                device, dpi, mode, paper, jpeg, geometry,
+                with_quality=quality, region=region,
+            ),
             timeout=300,
         )
         text = (result.stdout or "") + "\n" + (result.stderr or "")
@@ -356,6 +409,9 @@ def capture_page(device: str, dpi: int, mode: str, paper: str, jpeg: Path) -> No
         quality = False
         result, combined = once()
     if result.returncode != 0 and option_rejected(combined):
+        if region is not None:
+            detail = combined.strip() or "the scanner rejected the selected area"
+            raise RuntimeError(detail)
         geometry = False
         result, combined = once()
     if result.returncode != 0 and io_busy(combined):
@@ -393,7 +449,223 @@ def output_kind(document: str) -> str:
     return "jpeg"
 
 
-def do_scan(dpi: int, mode: str, paper: str, output: Path | None, kind: str, open_after: bool) -> Path:
+class StreamReader:
+    """Buffered reader that can pull PNM tokens and then exact raster bytes."""
+
+    def __init__(self, stream) -> None:
+        self.stream = stream
+        self.buf = b""
+        self.pos = 0
+
+    def read(self, count: int) -> bytes:
+        while self.pos + count > len(self.buf):
+            chunk = self.stream.read(65536)
+            if not chunk:
+                break
+            if self.pos:
+                self.buf = self.buf[self.pos:]
+                self.pos = 0
+            self.buf += chunk
+        end = min(self.pos + count, len(self.buf))
+        data = self.buf[self.pos:end]
+        self.pos = end
+        return data
+
+    def token(self) -> bytes:
+        while True:
+            char = self.read(1)
+            if not char:
+                raise RuntimeError("the scanner closed the image before the header finished")
+            if char == b"#":
+                while char not in (b"\n", b""):
+                    char = self.read(1)
+                continue
+            if char.isspace():
+                continue
+            break
+        parts = bytearray(char)
+        while True:
+            char = self.read(1)
+            if not char or char.isspace():
+                break
+            if char == b"#":
+                while char not in (b"\n", b""):
+                    char = self.read(1)
+                break
+            parts += char
+        return bytes(parts)
+
+
+def read_exact(reader: StreamReader, count: int) -> bytes:
+    data = reader.read(count)
+    if len(data) != count:
+        raise RuntimeError("the scanner stopped before the page was finished")
+    return data
+
+
+def expand_p4_row(row: bytes, width: int) -> bytes:
+    pixels = bytearray(width)
+    for index in range(width):
+        bit = (row[index // 8] >> (7 - (index % 8))) & 1
+        pixels[index] = 0 if bit else 255
+    return bytes(pixels)
+
+
+def write_strip_jpeg(
+    raw: bytes,
+    width: int,
+    rows: int,
+    channels: int,
+    dest: Path,
+    max_width: int | None = 1000,
+) -> None:
+    if rows < 1 or width < 1 or not raw:
+        return
+    magic = b"P6" if channels == 3 else b"P5"
+    ppm = dest.with_name(dest.name + ".ppm")
+    ppm.write_bytes(b"%s\n%d %d\n255\n" % (magic, width, rows) + raw)
+    command = ["sips", "-s", "format", "jpeg"]
+    if max_width and width > max_width:
+        command.extend(["--resampleWidth", str(max_width)])
+    command.extend([str(ppm), "--out", str(dest)])
+    try:
+        result = run(command, timeout=120)
+    finally:
+        ppm.unlink(missing_ok=True)
+    if result.returncode != 0 or not dest.is_file():
+        detail = (result.stderr or result.stdout or "could not build the scan preview").strip()
+        raise RuntimeError(detail)
+
+
+def stream_pnm_preview(stream, live_jpeg: Path, on_progress, step: int = 10) -> tuple[bytes, int, int, int]:
+    """Read a SANE PNM stream and publish the scanned strip every `step` percent."""
+    reader = StreamReader(stream)
+    magic = reader.token()
+    if magic not in (b"P4", b"P5", b"P6"):
+        raise RuntimeError("the scanner did not return a page image")
+    width = int(reader.token())
+    height = int(reader.token())
+    maxval = 255 if magic == b"P4" else int(reader.token())
+    if width < 1 or height < 1:
+        raise RuntimeError("the scanner returned an empty page")
+    channels = 3 if magic == b"P6" else 1
+    if magic == b"P4":
+        stride = (width + 7) // 8
+    else:
+        stride = width * channels * (2 if maxval > 255 else 1)
+    rows = bytearray()
+    published = 0
+    for index in range(height):
+        row = read_exact(reader, stride)
+        if magic == b"P4":
+            rows += expand_p4_row(row, width)
+        elif maxval > 255:
+            rows += bytes(row[offset] for offset in range(0, len(row), 2))
+        else:
+            rows += row
+        percent = (index + 1) * 100 // height
+        mark = min(100, (percent // step) * step)
+        if mark >= published + step:
+            write_strip_jpeg(bytes(rows), width, index + 1, channels, live_jpeg)
+            published = mark
+            on_progress(published)
+    if published < 100:
+        write_strip_jpeg(bytes(rows), width, height, channels, live_jpeg)
+        on_progress(100)
+    return bytes(rows), width, height, channels
+
+
+def read_pnm_scan(
+    device: str,
+    dpi: int,
+    mode: str,
+    paper: str,
+    live_jpeg: Path,
+    geometry: bool,
+    quality: bool,
+    region: tuple[float, float, float, float] | None = None,
+):
+    args = scanimage_args(
+        device, dpi, mode, paper, None, geometry,
+        with_quality=quality, image_format="pnm", region=region,
+    )
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=tool_env())
+    errors: list[bytes] = []
+
+    def collect_errors() -> None:
+        if process.stderr is not None:
+            errors.append(process.stderr.read())
+
+    thread = threading.Thread(target=collect_errors, daemon=True)
+    thread.start()
+    raster = None
+    failure = ""
+    try:
+        if process.stdout is None:
+            raise RuntimeError("scanimage produced no image")
+        raster = stream_pnm_preview(
+            process.stdout,
+            live_jpeg,
+            lambda percent: print(f"PROGRESS:{percent}:{live_jpeg}", flush=True),
+        )
+    except Exception as exc:
+        failure = str(exc)
+        if process.poll() is None:
+            process.kill()
+    code = process.wait(timeout=60)
+    thread.join(timeout=2)
+    detail = (b"".join(errors).decode("utf-8", "replace") + "\n" + failure).strip()
+    if raster is None or code != 0:
+        raise RuntimeError(detail or "scanimage produced no image")
+    return raster
+
+
+def capture_progressive(
+    device: str,
+    dpi: int,
+    mode: str,
+    paper: str,
+    jpeg: Path,
+    live_jpeg: Path,
+    region: tuple[float, float, float, float] | None = None,
+) -> None:
+    try:
+        raw, width, height, channels = read_pnm_scan(device, dpi, mode, paper, live_jpeg, True, True, region)
+    except RuntimeError as exc:
+        text = str(exc)
+        if option_rejected(text):
+            try:
+                raw, width, height, channels = read_pnm_scan(device, dpi, mode, paper, live_jpeg, True, False, region)
+            except RuntimeError as again:
+                if region is not None or not option_rejected(str(again)):
+                    raise
+                raw, width, height, channels = read_pnm_scan(device, dpi, mode, paper, live_jpeg, False, False, region)
+        elif io_busy(text):
+            paused = pause_queues(cups_queues())
+            try:
+                time.sleep(1)
+                raw, width, height, channels = read_pnm_scan(device, dpi, mode, paper, live_jpeg, True, True, region)
+            finally:
+                resume_queues(paused)
+        else:
+            raise
+    write_strip_jpeg(raw, width, height, channels, jpeg, max_width=None)
+
+
+def jpeg_ready(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 100
+
+
+def do_scan(
+    dpi: int,
+    mode: str,
+    paper: str,
+    output: Path | None,
+    kind: str,
+    open_after: bool,
+    progress: bool = False,
+    region: tuple[float, float, float, float] | None = None,
+) -> Path:
     payload = status_payload()
     device = payload["sane_device"]
     if not device:
@@ -401,13 +673,33 @@ def do_scan(dpi: int, mode: str, paper: str, output: Path | None, kind: str, ope
     destination = normalize_destination(output or default_output(kind), kind)
     destination.parent.mkdir(parents=True, exist_ok=True)
     work = destination.with_suffix(".scan.jpg")
+    live = destination.with_name(destination.stem + ".live.jpg")
     print(f"Scanning {device} at {dpi} DPI, {SANE_MODES[mode]}, {paper}.", flush=True)
+    # CUPS keeps the USB interface even while the queue is idle, and sane_start
+    # then reports "Device busy". Release it for the scan and give it back after.
+    paused = pause_queues(cups_queues())
+    if paused:
+        time.sleep(0.6)
     try:
-        capture_page(device, dpi, mode, paper, work)
+        if progress:
+            try:
+                capture_progressive(device, dpi, mode, paper, work, live, region)
+            except Exception as exc:
+                if live.exists() and live.stat().st_size > 100:
+                    raise
+                capture_page(device, dpi, mode, paper, work, region)
+                if not jpeg_ready(work):
+                    raise RuntimeError(str(exc)) from exc
+                print(f"PROGRESS:100:{work}", flush=True)
+        else:
+            capture_page(device, dpi, mode, paper, work, region)
         convert_image(work, destination, kind)
     finally:
+        resume_queues(paused)
         if work.exists() and work.resolve() != destination.resolve():
             work.unlink(missing_ok=True)
+        live.unlink(missing_ok=True)
+        Path(str(live) + ".ppm").unlink(missing_ok=True)
     print(f"SAVED:{destination}", flush=True)
     if open_after:
         run(["open", str(destination)], timeout=15)
@@ -796,6 +1088,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--output", type=Path)
     scan.add_argument("--format", default="pdf", choices=("pdf", "jpeg", "png", "tiff"))
     scan.add_argument("--no-open", action="store_true")
+    scan.add_argument("--progress", action="store_true", help="print the scanned strip every 10 percent")
+    scan.add_argument("--region", help="left,top,right,bottom in millimetres, instead of the whole page")
 
     bridge = sub.add_parser("bridge", help="serve a local AirScan endpoint for Image Capture")
     bridge.add_argument("--port", type=int, default=BRIDGE_PORT)
@@ -836,7 +1130,11 @@ def main(argv: list[str] | None = None) -> int:
             serve_bridge(args.port, advertise_service=not args.no_mdns)
             return 0
         mode = "gray" if args.mode == "grey" else args.mode
-        do_scan(args.dpi, mode, args.paper, args.output, args.format, not args.no_open)
+        region = parse_region(args.region, args.paper) if args.region else None
+        do_scan(
+            args.dpi, mode, args.paper, args.output, args.format,
+            not args.no_open, progress=args.progress, region=region,
+        )
         return 0
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

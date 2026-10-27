@@ -26,7 +26,7 @@ dj1050-scan doctor
 dj1050-scan --dpi 300 --mode color --paper a4
 ```
 
-The app scans first and shows the page. **Output type** is Color, Grayscale, or Black and white. **File type** is JPEG, PDF, PNG, or TIFF, and Save asks for that file. Rotate, Lighter, and Darker apply to the preview before it is written.
+**Preview at 75 DPI** opens a large window and scans the glass quickly. The picture fills in every 10%. Drag a box around the part you want, then **Scan box** at the detail resolution (300 DPI by default) so only that area is scanned slowly. Save writes the image in the window. Save crop writes only the box. File types are JPEG, PDF, PNG, and TIFF. **Output type** is Color, Grayscale, or Black and white.
 
 From the terminal, `--paper` accepts `a4`, `letter`, or `full`. `--format` accepts `pdf`, `jpeg`, `png`, or `tiff`. `--mode` accepts `color`, `gray`, or `lineart`. Color is the default. The scanner is asked for its clearest JPEG, the same idea as HP Scan's "None" compression on Windows.
 
